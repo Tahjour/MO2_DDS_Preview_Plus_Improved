@@ -1,25 +1,29 @@
 import struct
 import sys
-import threading
 import enum
 import os
-import pathlib
 import shutil
 import time
 import weakref
 import json
-import subprocess
 
-from PyQt6.QtCore import QCoreApplication, qDebug, Qt, QPoint, QSize, QSettings
-from PyQt6.QtGui import QColor, QOpenGLContext, QSurfaceFormat, QMatrix4x4, QVector4D, QIcon, QWheelEvent, QMouseEvent
+from PyQt6.QtCore import QCoreApplication, qDebug, Qt, QPoint, QSize, QSettings, pyqtSignal
+from PyQt6.QtGui import QColor, QOpenGLContext, QSurfaceFormat, QMatrix4x4, QVector4D, QWheelEvent, QMouseEvent
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
-from PyQt6.QtWidgets import (QCheckBox, QDialog, QGridLayout, QLabel, QPushButton, QWidget, 
-                             QColorDialog, QComboBox, QListWidget, QListWidgetItem, QVBoxLayout,
-                             QHBoxLayout, QMessageBox, QGroupBox, QScrollArea, QFrame, QSplitter)
+from PyQt6.QtWidgets import (QCheckBox, QDialog, QLabel, QPushButton, QWidget, 
+                             QColorDialog, QComboBox, QVBoxLayout, QHBoxLayout,
+                             QMessageBox, QScrollArea, QFrame, QSplitter,
+                             QToolButton, QApplication)
 from PyQt6.QtOpenGL import QOpenGLBuffer, QOpenGLDebugLogger, QOpenGLShader, QOpenGLShaderProgram, QOpenGLTexture, \
-    QOpenGLVersionProfile, QOpenGLVertexArrayObject, QOpenGLFunctions_4_1_Core, QOpenGLVersionFunctionsFactory
+    QOpenGLVersionProfile, QOpenGLVertexArrayObject, QOpenGLVersionFunctionsFactory
 
 from DDS.DDSFile import DDSFile
+
+from dds_sources import (
+    DdsSourceSet,
+    normalize_data_path,
+    resolve_dds_sources,
+)
 
 if "mobase" not in sys.modules:
     import mock_mobase as mobase
@@ -205,6 +209,8 @@ glVersionProfile.setVersion(2, 1)
 
 
 class DDSWidget(QOpenGLWidget):
+    viewChanged = pyqtSignal(object)
+
     def __init__(self, ddsFile, ddsOptions=DDSOptions(), debugContext=False, parent=None, f=Qt.WindowType(0)):
         super(DDSWidget, self).__init__(parent, f)
         self.ddsFile = ddsFile
@@ -247,6 +253,33 @@ class DDSWidget(QOpenGLWidget):
     def __dtor__(self):
         pass
 
+    def viewState(self):
+        return {
+            "zoom": float(self.zoom),
+            "pan_x": float(self.panX),
+            "pan_y": float(self.panY),
+        }
+
+    def setViewState(self, state, emit_signal=False):
+        if not state:
+            return
+        self.zoom = max(self.minZoom, min(self.maxZoom, float(state.get("zoom", self.zoom))))
+        self.panX = float(state.get("pan_x", self.panX))
+        self.panY = float(state.get("pan_y", self.panY))
+        self._updateViewMatrix()
+        self.update()
+        if emit_signal:
+            self.viewChanged.emit(self.viewState())
+
+    def resetView(self, emit_signal=True):
+        self.zoom = 1.0
+        self.panX = 0.0
+        self.panY = 0.0
+        self._updateViewMatrix()
+        self.update()
+        if emit_signal:
+            self.viewChanged.emit(self.viewState())
+
     def wheelEvent(self, event: QWheelEvent):
         """Handle mouse wheel for zooming"""
         delta = event.angleDelta().y()
@@ -266,12 +299,13 @@ class DDSWidget(QOpenGLWidget):
             self.panY = self.panY * actualZoomChange + normY * (1.0 - actualZoomChange) / self.zoom
             self._updateViewMatrix()
             self.update()
+            self.viewChanged.emit(self.viewState())
         
         event.accept()
 
     def mousePressEvent(self, event: QMouseEvent):
         """Start panning on middle or right mouse button"""
-        if event.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.LeftButton):
+        if event.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.RightButton):
             self.isPanning = True
             self.lastMousePos = event.pos()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
@@ -281,7 +315,7 @@ class DDSWidget(QOpenGLWidget):
 
     def mouseReleaseEvent(self, event: QMouseEvent):
         """Stop panning"""
-        if event.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.LeftButton):
+        if event.button() in (Qt.MouseButton.MiddleButton, Qt.MouseButton.RightButton):
             self.isPanning = False
             self.lastMousePos = None
             self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -298,6 +332,7 @@ class DDSWidget(QOpenGLWidget):
             self.panY -= (delta.y() / self.height()) * 5.0 / self.zoom
             self._updateViewMatrix()
             self.update()
+            self.viewChanged.emit(self.viewState())
             event.accept()
         else:
             super().mouseMoveEvent(event)
@@ -305,11 +340,7 @@ class DDSWidget(QOpenGLWidget):
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         """Reset zoom and pan on double click"""
         if event.button() == Qt.MouseButton.LeftButton:
-            self.zoom = 1.0
-            self.panX = 0.0
-            self.panY = 0.0
-            self._updateViewMatrix()
-            self.update()
+            self.resetView(emit_signal=True)
             event.accept()
         else:
             super().mouseDoubleClickEvent(event)
@@ -533,9 +564,9 @@ class DDSChannelManager:
             channelVector = [0, 0, 0, 0]
             if channels == ColourChannels.R:
                 channelVector[0] = 1
-            elif channel == ColourChannels.G:
+            elif channels == ColourChannels.G:
                 channelVector[1] = 1
-            elif channel == ColourChannels.B:
+            elif channels == ColourChannels.B:
                 channelVector[2] = 1
             elif channels == ColourChannels.A:
                 channelVector[3] = 1
@@ -554,742 +585,697 @@ class DDSChannelManager:
             drawGrayscale(channels)
 
 
-class ConflictInfo:
-    def __init__(self, organizer, file_path):
-        self.organizer = organizer
-        self.file_path = file_path
-        self.conflicts = []
-        self.hidden_files = {}  # mod_name: list of {'original': path, 'hidden': path.mohidden}
-        self.nif_addiction_data = None  # Данные из NifDDsaddiction.json
-        self.bsa_conflicts = []  # BSA конфликты для текущего DDS
-        self.nif_references = []  # NIF файлы ссылающиеся на текущий DDS
-        self.analysis_loaded = False  # Флаг: данные анализа из JSON загружены
-        self._loadConflicts()
+class PreviewDialogChromeGuard:
+    def __init__(self, widget: QWidget):
+        self.widget = widget
+        self.preview_dialog = None
+        self.hidden_widgets = []
+        self.applied = False
 
-    def loadAnalysisData(self):
-        """Опционально загружает данные анализа из JSON и находит BSA/NIF ссылки."""
-        self._loadNifAddictionData()
-        self.bsa_conflicts = []
-        self.nif_references = []
-        self._findBSAConflicts()
-        self._findNifReferences()
-        self.analysis_loaded = True
+    def apply(self):
+        if self.applied:
+            return
+        self.applied = True
 
-    def _loadNifAddictionData(self):
-        """Получает кешированные данные из NifDDsaddiction.json через DDSPreview"""
+        parent = self.widget.parentWidget()
+        while parent is not None:
+            if parent.objectName() == "PreviewDialog":
+                self.preview_dialog = parent
+                break
+            parent = parent.parentWidget()
+
+        if self.preview_dialog is None:
+            return
+
+        for name in ("nameLabel", "modLabel", "previousButton", "nextButton"):
+            child = self.preview_dialog.findChild(QWidget, name)
+            if child is not None:
+                self.hidden_widgets.append((child, child.isVisible()))
+                child.setVisible(False)
+
+        self.preview_dialog.destroyed.connect(self.restore)
+
+    def restore(self):
+        for child, was_visible in self.hidden_widgets:
+            try:
+                child.setVisible(was_visible)
+            except RuntimeError:
+                pass
+        self.hidden_widgets.clear()
+
+
+class DdsPreviewPane(QWidget):
+    viewChanged = pyqtSignal(object)
+    providerChanged = pyqtSignal()
+
+    def __init__(self, title: str, options: DDSOptions, debugContext=False, parent=None):
+        super().__init__(parent)
+        self.options = options
+        self.debugContext = debugContext
+        self.sources = DdsSourceSet([], "")
+        self.current_index = 0
+        self.current_widget = None
+        self._loading = False
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(4)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        header = QHBoxLayout()
+        header.setSpacing(4)
+
+        self.title_label = QLabel(title)
+        self.title_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        header.addWidget(self.title_label, 1)
+
+        self.prev_button = QToolButton()
+        self.prev_button.setText("<")
+        self.prev_button.setToolTip(self.tr("Previous DDS source"))
+        self.prev_button.clicked.connect(lambda: self.selectRelativeProvider(-1))
+        header.addWidget(self.prev_button)
+
+        self.source_combo = QComboBox()
+        self.source_combo.currentIndexChanged.connect(self.selectProvider)
+        header.addWidget(self.source_combo, 3)
+
+        self.next_button = QToolButton()
+        self.next_button.setText(">")
+        self.next_button.setToolTip(self.tr("Next DDS source"))
+        self.next_button.clicked.connect(lambda: self.selectRelativeProvider(1))
+        header.addWidget(self.next_button)
+
+        layout.addLayout(header)
+
+        self.location_label = QLabel("")
+        self.location_label.setWordWrap(True)
+        self.location_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.location_label)
+
+        self.view_host = QWidget()
+        self.view_layout = QVBoxLayout(self.view_host)
+        self.view_layout.setContentsMargins(0, 0, 0, 0)
+        self.view_layout.setSpacing(0)
+        layout.addWidget(self.view_host, 1)
+
+        self.info_label = QLabel("")
+        self.info_label.setWordWrap(True)
+        self.info_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.info_label)
+
+    def setSources(self, sources: DdsSourceSet, index: int = 0):
+        self.sources = sources
+        if sources.providers:
+            self.current_index = max(0, min(index, len(sources.providers) - 1))
+        else:
+            self.current_index = 0
+
+        self._loading = True
+        self.source_combo.clear()
+        for provider in sources.providers:
+            suffix = ""
+            if provider.source_kind == "bsa":
+                suffix = " (BSA)"
+            elif provider.source_kind == "memory":
+                suffix = " (Archive Preview)"
+            self.source_combo.addItem(provider.display_name + suffix)
+        self.source_combo.setCurrentIndex(self.current_index if sources.providers else -1)
+        self._loading = False
+        self._updateSourceControls()
+        self._loadCurrentProvider()
+
+    def currentProvider(self):
+        if 0 <= self.current_index < len(self.sources.providers):
+            return self.sources.providers[self.current_index]
+        return None
+
+    def currentViewState(self):
+        if isinstance(self.current_widget, DDSWidget):
+            return self.current_widget.viewState()
+        return {}
+
+    def setViewState(self, state, emit_signal=False):
+        if isinstance(self.current_widget, DDSWidget):
+            self.current_widget.setViewState(state, emit_signal=emit_signal)
+
+    def resetView(self):
+        if isinstance(self.current_widget, DDSWidget):
+            self.current_widget.resetView(emit_signal=True)
+
+    def updateRenderOptions(self):
+        if isinstance(self.current_widget, DDSWidget):
+            self.current_widget.update()
+
+    def cleanup(self):
+        self._setViewWidget(None)
+
+    def selectRelativeProvider(self, delta: int):
+        if not self.sources.providers:
+            return
+        self.selectProvider((self.current_index + delta) % len(self.sources.providers))
+
+    def selectProvider(self, index: int):
+        if self._loading:
+            return
+        if not (0 <= index < len(self.sources.providers)):
+            return
+        if index == self.current_index and isinstance(self.current_widget, DDSWidget):
+            return
+        view_state = self.currentViewState()
+        self.current_index = index
+        if self.source_combo.currentIndex() != index:
+            self.source_combo.setCurrentIndex(index)
+        self._loadCurrentProvider(view_state)
+        self.providerChanged.emit()
+
+    def _loadCurrentProvider(self, view_state=None):
+        provider = self.currentProvider()
+        if provider is None:
+            self.location_label.setText(self.tr("No DDS providers found."))
+            self.info_label.setText("")
+            self._setViewWidget(QLabel(self.tr("No preview available.")))
+            self._updateSourceControls()
+            return
+
+        self.title_label.setText(provider.filename)
+        self.location_label.setText(provider.location_text)
+
         try:
-            # Используем кешированные данные из DDSPreview
-            self.nif_addiction_data = DDSPreview.getNifAddictionData(self.organizer)
+            dds_file = self._loadDdsFile(provider)
+            widget = DDSWidget(dds_file, self.options, self.debugContext)
+            widget.viewChanged.connect(self.viewChanged.emit)
+            self._setViewWidget(widget)
+            self.info_label.setText(dds_file.getDescription())
+            if view_state:
+                widget.setViewState(view_state)
         except Exception as e:
-            # В случае ошибки используем пустые данные
-            self.nif_addiction_data = None
+            label = QLabel(self.tr(f"Error loading DDS source:\n{str(e)}"))
+            label.setWordWrap(True)
+            self._setViewWidget(label)
+            self.info_label.setText("")
 
-    def _normalize_path(self, path):
-        """Нормализует путь для сравнения"""
-        return path.replace('\\', '/').lower()
+        self._updateSourceControls()
 
-    def _extract_filename(self, path):
-        """Извлекает имя файла из пути"""
-        return os.path.basename(path).lower()
+    def _loadDdsFile(self, provider):
+        if provider.source_kind == "loose" and provider.physical_path:
+            dds_file = DDSFile.fromFile(provider.physical_path)
+        else:
+            dds_file = DDSFile(provider.data, provider.virtual_path or provider.filename)
+        dds_file.load()
+        return dds_file
 
-    def _findBSAConflicts(self):
-        """Находит BSA конфликты для текущего DDS файла"""
-        if not self.nif_addiction_data:
-            return
-            
-        current_filename = self._extract_filename(self.file_path)
-        
-        for mod_data in self.nif_addiction_data:
-            mod_name = mod_data.get('mod_name', '')
-            dds_files = mod_data.get('dds_files', [])
-            
-            for dds_path in dds_files:
-                # Проверяем только BSA файлы
-                if '.bsa]/' in dds_path:
-                    dds_filename = self._extract_filename(dds_path)
-                    if dds_filename == current_filename:
-                        self.bsa_conflicts.append({
-                            'mod_name': mod_name,
-                            'path': dds_path,
-                            'type': 'BSA'
-                        })
+    def _setViewWidget(self, widget):
+        old = self.current_widget
+        if old is not None:
+            self.view_layout.removeWidget(old)
+            try:
+                if isinstance(old, DDSWidget) and not old.clean:
+                    old.cleanup()
+            except Exception:
+                pass
+            old.setParent(None)
+            old.deleteLater()
 
-    def _findNifReferences(self):
-        """Находит NIF файлы ссылающиеся на текущий DDS"""
-        if not self.nif_addiction_data:
-            return
-            
-        current_filename = self._extract_filename(self.file_path)
-        current_path_normalized = self._normalize_path(self.file_path)
-        
-        for mod_data in self.nif_addiction_data:
-            mod_name = mod_data.get('mod_name', '')
-            nif_files = mod_data.get('nif_files', {})
-            
-            for nif_path, dds_refs in nif_files.items():
-                for dds_ref in dds_refs:
-                    dds_ref_filename = self._extract_filename(dds_ref)
-                    dds_ref_normalized = self._normalize_path(dds_ref)
-                    
-                    # Проверяем совпадение по имени файла или полному пути
-                    if (dds_ref_filename == current_filename or 
-                        current_path_normalized in dds_ref_normalized):
-                        self.nif_references.append({
-                            'mod_name': mod_name,
-                            'nif_path': nif_path,
-                            'dds_ref': dds_ref
-                        })
+        self.current_widget = widget
+        if widget is not None:
+            self.view_layout.addWidget(widget)
 
-    def _loadConflicts(self):
-        mods_directory = self.organizer.modsPath()
-        try:
-            relative_path = os.path.join(*pathlib.Path(self.file_path).relative_to(mods_directory).parts[1:])
-        except (ValueError, IndexError):
-            return
-        
-        origins = self.organizer.getFileOrigins(relative_path)
-        for origin in origins:
-            mod = self.organizer.modList().getMod(origin)
-            if mod:
-                mod_path = mod.absolutePath()
-                full_path = os.path.join(mod_path, relative_path)
-                
-                # Load JSON for this mod
-                json_path = os.path.join(mod_path, 'dds_actions.json')
-                hidden_in_mod = []
-                if os.path.exists(json_path):
-                    try:
-                        with open(json_path, 'r') as f:
-                            data = json.load(f)
-                            hidden_in_mod = data.get('hidden', [])
-                            self.hidden_files[origin] = hidden_in_mod
-                    except Exception as e:
-                        print(f"DEBUG: Error loading JSON for mod {origin}: {str(e)}")
-                
-                # Check if this file is hidden
-                is_hidden = False
-                for h in hidden_in_mod:
-                    if h['hidden'] == full_path + '.mohidden':
-                        full_path = h['hidden']  # Use hidden path for size, etc.
-                        is_hidden = True
-                        break
-                
-                if os.path.exists(full_path) or is_hidden:
-                    file_size = os.path.getsize(full_path) if os.path.exists(full_path) else 0
-                    is_current = os.path.normpath(full_path) == os.path.normpath(self.file_path)
-                    self.conflicts.append({
-                        'mod_name': origin,
-                        'mod': mod,
-                        'path': full_path,
-                        'relative_path': relative_path,
-                        'size': file_size,
-                        'is_current': is_current,
-                        'is_hidden': is_hidden
-                    })
+    def _updateSourceControls(self):
+        count = len(self.sources.providers)
+        self.prev_button.setEnabled(count > 1)
+        self.next_button.setEnabled(count > 1)
+        self.source_combo.setEnabled(count > 1)
 
-    def getActiveFile(self):
-        return self.conflicts[0] if self.conflicts else None
-    
-    def getOverwrittenFiles(self):
-        return self.conflicts[1:] if len(self.conflicts) > 1 else []
+    def tr(self, str_):
+        return QCoreApplication.translate("DdsPreviewPane", str_)
 
 
-class ConflictWidget(QWidget):
-    def __init__(self, organizer, conflict_info, options, parent=None):
+class DdsManageFilesDialog(QDialog):
+    def __init__(self, organizer, sources: DdsSourceSet, parent=None):
         super().__init__(parent)
         self.organizer = organizer
-        self.conflict_info = conflict_info
-        self.options = options
-        self.deleted_files = {}
-        self.preview_widgets = []
-        self._initUI()
-    
-    def __del__(self):
-        self._cleanupPreviews()
-    
-    def _cleanupPreviews(self):
-        """Properly clean up all preview widgets"""
-        for widget_ref in self.preview_widgets[:]:
-            widget = widget_ref() if isinstance(widget_ref, weakref.ref) else widget_ref
-            if widget is not None:
-                try:
-                    if isinstance(widget, DDSWidget) and not widget.clean:
-                        widget.cleanup()
-                    widget.deleteLater()
-                except (RuntimeError, SystemError, AttributeError) as e:
-                    print(f"DEBUG: Error cleaning up preview widget: {str(e)}")
-                finally:
-                    self.preview_widgets.remove(widget_ref)
-        self.preview_widgets.clear()
-    
-    def _initUI(self):
-        main_layout = QVBoxLayout()
-        
-        # Создаем вертикальный сплиттер: сверху конфликты, снизу NIF ссылки
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        
-        # Верхняя часть - конфликты (70%) в том же столбце
-        conflicts_widget = QWidget()
-        conflicts_layout = QVBoxLayout(conflicts_widget)
-        
-        # Панель инструментов для опционального JSON-сканирования
-        toolbar_layout = QHBoxLayout()
-        self.scan_btn = QPushButton(self.tr("Load Inf"))
-        self.scan_btn.setToolTip(self.tr("Download analysis from JSON. Without clicking, only data from the MO2 API is shown."))
-        self.scan_btn.clicked.connect(self._onScanClicked)
-        toolbar_layout.addWidget(self.scan_btn)
-        toolbar_layout.addStretch()
-        conflicts_layout.addLayout(toolbar_layout)
-        
-        # Обернуть весь контент конфликтов в QScrollArea
+        self.sources = sources
+        self.changed = False
+        self.setWindowTitle(self.tr("Manage DDS Sources"))
+        self.resize(760, 520)
+
+        layout = QVBoxLayout(self)
+        help_label = QLabel(self.tr(
+            "Loose overwritten DDS files can be hidden or backed up and removed. "
+            "BSA and current archive preview entries are read-only."
+        ))
+        help_label.setWordWrap(True)
+        layout.addWidget(help_label)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll_content = QWidget()
-        content_layout = QVBoxLayout(scroll_content)
-        
-        active_group = QGroupBox(self.tr("Active File (Wins Conflict)"))
-        active_layout = QVBoxLayout()
-        
-        active_file = self.conflict_info.getActiveFile()
-        if active_file:
-            active_widget = self._createFileWidget(active_file, 0, is_active=True)
-            active_layout.addWidget(active_widget)
-        else:
-            active_layout.addWidget(QLabel(self.tr("File not found in mods")))
-        
-        active_group.setLayout(active_layout)
-        content_layout.addWidget(active_group)
-        
-        overwritten = self.conflict_info.getOverwrittenFiles()
-        if overwritten:
-            overwritten_group = QGroupBox(self.tr(f"Overwritten Files ({len(overwritten)})"))
-            overwritten_layout = QVBoxLayout()
-            
-            overwritten_scroll = QScrollArea()
-            overwritten_scroll.setWidgetResizable(True)
-            overwritten_content = QWidget()
-            overwritten_scroll_layout = QVBoxLayout(overwritten_content)
-            
-            for i, file_info in enumerate(overwritten):
-                file_widget = self._createFileWidget(file_info, i + 1, is_active=False)
-                overwritten_scroll_layout.addWidget(file_widget)
-            
-            overwritten_scroll_layout.addStretch()
-            overwritten_scroll.setWidget(overwritten_content)
-            overwritten_layout.addWidget(overwritten_scroll, 1)  # Stretch to fill space
-            
-            overwritten_group.setLayout(overwritten_layout)
-            content_layout.addWidget(overwritten_group, 1)  # Stretch to fill space
-        else:
-            no_conflicts = QLabel(self.tr("No conflicts - this file doesn't override other files"))
-            content_layout.addWidget(no_conflicts)
-        
-        # Добавляем BSA конфликты (опционально, по кнопке Scan)
-        # Создаем секцию и наполняем ее в _refreshBsaSection
-        self.bsa_section = QWidget()
-        self.bsa_section.setLayout(QVBoxLayout())
-        content_layout.addWidget(self.bsa_section)
-        
-        # Обновляем содержимое секции (покажет заглушку до загрузки анализа)
-        self._refreshBsaSection()
-        
-        content_layout.addStretch()
-        scroll.setWidget(scroll_content)
-        conflicts_layout.addWidget(scroll, 1)  # Верхняя часть сплиттера
-        
-        # Нижняя часть - NIF файлы (опционально, по кнопке Scan) в том же столбце, со своим скроллом
-        nif_widget = QWidget()
-        nif_layout = QVBoxLayout(nif_widget)
-        
-        # Секция NIF ссылок, наполняется в _refreshNifSection
-        self.nif_section = QWidget()
-        self.nif_section.setLayout(QVBoxLayout())
-        nif_layout.addWidget(self.nif_section, 1)
-        
-        # Обновляем содержимое секции (покажет заглушку до загрузки анализа)
-        self._refreshNifSection()
-        
-        # Добавляем виджеты в вертикальный сплиттер (тот же столбец)
-        splitter.addWidget(conflicts_widget)
-        splitter.addWidget(nif_widget)
-        
-        # Сохраняем ссылку на сплиттер и восстанавливаем размеры из настроек
-        self._splitter = splitter
-        settings = QSettings("xAI", "DDSPreview")
-        sizes = settings.value("conflicts_nif_splitter_sizes", [700, 300])
-        try:
-            sizes = [int(s) for s in sizes]
-        except (TypeError, ValueError):
-            sizes = [700, 300]
-        if not isinstance(sizes, (list, tuple)) or len(sizes) != 2:
-            sizes = [700, 300]
-        splitter.setSizes(sizes)
+        body = QWidget()
+        self.body_layout = QVBoxLayout(body)
+        self.body_layout.setSpacing(6)
+        self.body_layout.setContentsMargins(6, 6, 6, 6)
+        scroll.setWidget(body)
+        layout.addWidget(scroll, 1)
 
-        # Устанавливаем пропорции: 70% для конфликтов (сверху), 30% для NIF (снизу)
-        splitter.setStretchFactor(0, 7)
-        splitter.setStretchFactor(1, 3)
-        
-        # Сохраняем размеры при уничтожении виджета
-        def save_splitter_sizes():
-            settings.setValue("conflicts_nif_splitter_sizes", [int(s) for s in splitter.sizes()])
-        self.destroyed.connect(save_splitter_sizes)
-        
-        main_layout.addWidget(splitter, 1)
-        self.setLayout(main_layout)
-    
-    def _createFileWidget(self, file_info, index, is_active=False):
-        widget = QFrame()
-        widget.setFrameShape(QFrame.Shape.StyledPanel)
-        main_layout = QVBoxLayout()
-        
-        top_layout = QHBoxLayout()
-        
-        prefix = "🏆 " if is_active else f"#{index}. "
-        
-        # Get relative path from mods directory
-        try:
-            mods_path = self.organizer.modsPath()
-            full_path = file_info['path']
-            relative_display_path = os.path.relpath(full_path, mods_path)
-        except:
-            relative_display_path = file_info['path']
-        
-        info_text = f"<b>{prefix}{file_info['mod_name']}</b><br>" \
-                   f"Size: {self._formatSize(file_info['size'])}<br>" \
-                   f"Path: {relative_display_path}"
-        
-        if file_info['is_current']:
-            info_text = f"<span style='color: #00AA00;'>➤ CURRENT FILE</span><br>" + info_text
-        
-        if file_info.get('is_hidden', False):
-            info_text += "<br><span style='color: #2196f3;'>🔒 (Hidden)</span>"
-        
-        info_label = QLabel(info_text)
-        info_label.setWordWrap(True)
-        info_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        top_layout.addWidget(info_label, 1)
-        
-        btn_layout = QVBoxLayout()
-        
-        preview_btn = QPushButton(self.tr("Preview"))
-        preview_btn.setToolTip(self.tr("Show preview of this file"))
-        preview_btn.clicked.connect(lambda: self._showPreview(file_info, widget))
-        btn_layout.addWidget(preview_btn)
-        
-        if not is_active:
-            if not file_info.get('is_hidden', False):
+        close_btn = QPushButton(self.tr("Close"))
+        close_btn.clicked.connect(self.accept)
+        bottom = QHBoxLayout()
+        bottom.addStretch()
+        bottom.addWidget(close_btn)
+        layout.addLayout(bottom)
+
+        self._populate()
+
+    def _populate(self):
+        for index, provider in enumerate(self.sources.providers):
+            frame = QFrame()
+            frame.setFrameShape(QFrame.Shape.StyledPanel)
+            row = QVBoxLayout(frame)
+            row.setContentsMargins(8, 6, 8, 6)
+
+            title = QLabel(f"#{index + 1}. {provider.display_name}")
+            title.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            row.addWidget(title)
+
+            details = QLabel(
+                f"Kind: {provider.source_kind}\n"
+                f"Path: {provider.location_text}"
+            )
+            details.setWordWrap(True)
+            details.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            row.addWidget(details)
+
+            actions = QHBoxLayout()
+            actions.addStretch()
+            eligible = provider.is_manageable_loose_file and index != self.sources.current_index
+
+            if eligible:
                 hide_btn = QPushButton(self.tr("Hide DDS"))
-                hide_btn.setToolTip(self.tr("Hide this file by renaming to *.dds.mohidden"))
-                hide_btn.clicked.connect(lambda: self._hideFile(file_info, widget))
-                btn_layout.addWidget(hide_btn)
-                widget.hide_btn = hide_btn
-            
-            delete_btn = QPushButton(self.tr("Delete"))
-            delete_btn.setToolTip(self.tr("Delete this file (backup will be created)"))
-            delete_btn.clicked.connect(lambda: self._deleteFile(file_info, widget))
-            btn_layout.addWidget(delete_btn)
-            widget.delete_btn = delete_btn
-        
-        top_layout.addLayout(btn_layout)
-        main_layout.addLayout(top_layout)
-        
-        preview_container = QWidget()
-        preview_layout = QVBoxLayout()
-        preview_container.setLayout(preview_layout)
-        preview_container.setVisible(False)
-        main_layout.addWidget(preview_container)
-        
-        widget.setLayout(main_layout)
-        
-        
-        widget.file_info = file_info
-        widget.preview_container = preview_container
-        widget.preview_layout = preview_layout
-        widget.preview_btn = preview_btn
-        
-        return widget
+                hide_btn.clicked.connect(lambda _=False, p=provider, f=frame: self._hideProvider(p, f))
+                actions.addWidget(hide_btn)
 
-    def _createBSAWidget(self, bsa_info, index):
-        """Создает виджет для отображения BSA конфликта"""
-        widget = QFrame()
-        widget.setFrameShape(QFrame.Shape.StyledPanel)
-        
-        layout = QVBoxLayout()
-        
-        info_text = f"<b>#{index}. {bsa_info['mod_name']} (BSA)</b><br>" \
-                   f"Path: {bsa_info['path']}"
-        
-        info_label = QLabel(info_text)
-        info_label.setWordWrap(True)
-        info_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(info_label)
-        
-        widget.setLayout(layout)
-        return widget
+                delete_btn = QPushButton(self.tr("Delete with Backup"))
+                delete_btn.clicked.connect(lambda _=False, p=provider, f=frame: self._deleteProvider(p, f))
+                actions.addWidget(delete_btn)
+            else:
+                reason = self.tr("Read-only")
+                if index == self.sources.current_index:
+                    reason = self.tr("Current provider")
+                elif provider.source_kind == "loose":
+                    reason = self.tr("Loose source is not managed by a mod")
+                readonly = QLabel(reason)
+                readonly.setStyleSheet("color: #888;")
+                actions.addWidget(readonly)
 
-    def _createNifWidget(self, nif_info, index):
-        """Создает виджет для отображения NIF файла ссылающегося на DDS"""
-        widget = QFrame()
-        widget.setFrameShape(QFrame.Shape.StyledPanel)
-        
-        layout = QVBoxLayout()
-        
-        info_text = f"<b>#{index}. {nif_info['mod_name']}</b><br>" \
-                   f"NIF: {nif_info['nif_path']}<br>" \
-                   f"DDS Reference: {nif_info['dds_ref']}"
-        
-        info_label = QLabel(info_text)
-        info_label.setWordWrap(True)
-        info_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(info_label)
-        
-        widget.setLayout(layout)
-        return widget
-    
-    def _clearLayout(self, layout):
-        """Удаляет все виджеты из переданного layout"""
+            row.addLayout(actions)
+            self.body_layout.addWidget(frame)
+
+        self.body_layout.addStretch()
+
+    def _hideProvider(self, provider, frame):
+        answer = QMessageBox.question(
+            self,
+            self.tr("Confirm Hide"),
+            self.tr(
+                f"Hide this DDS from mod '{provider.display_name}'?\n\n"
+                f"{provider.physical_path}\n\n"
+                "It will be renamed to *.mohidden and tracked for the Hidden Files Manager."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        hidden_path = provider.physical_path + ".mohidden"
         try:
-            while layout.count():
-                item = layout.takeAt(0)
-                w = item.widget()
-                if w is not None:
-                    try:
-                        w.deleteLater()
-                    except Exception:
-                        pass
+            if os.path.exists(hidden_path):
+                raise ValueError("Hidden target already exists.")
+            shutil.move(provider.physical_path, hidden_path)
+            self._updateJson(provider.owner, provider.physical_path, hidden_path)
+            self._notifyModChanged(provider.owner)
+            self.changed = True
+            frame.setEnabled(False)
+            QMessageBox.information(self, self.tr("DDS Hidden"), self.tr("DDS file hidden."))
+        except Exception as e:
+            QMessageBox.critical(self, self.tr("Error"), self.tr(f"Failed to hide DDS:\n{str(e)}"))
+
+    def _deleteProvider(self, provider, frame):
+        answer = QMessageBox.question(
+            self,
+            self.tr("Confirm Delete"),
+            self.tr(
+                f"Back up and remove this DDS from mod '{provider.display_name}'?\n\n"
+                f"{provider.physical_path}"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            backup_mod_name = time.strftime("DDSPreview_Backup_%Y_%m_%d_%H_%M_%S")
+            backup_mod = None
+            try:
+                backup_mod = self.organizer.modList().getMod(backup_mod_name)
+                if not backup_mod:
+                    backup_mod = self.organizer.createMod(
+                        mobase.GuessedString(value=backup_mod_name, quality=mobase.GuessQuality.PRESET)
+                    )
+            except Exception:
+                backup_mod = None
+
+            backup_root = backup_mod.absolutePath() if backup_mod else os.path.join(self.organizer.modsPath(), backup_mod_name)
+            relative = provider.virtual_path or os.path.basename(provider.physical_path)
+            destination = os.path.join(backup_root, provider.owner, *relative.split("/"))
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            shutil.move(provider.physical_path, destination)
+            self._removeEmptyFoldersRecursive(os.path.dirname(provider.physical_path), self._modRoot(provider.owner))
+            self._notifyModChanged(provider.owner)
+            if backup_mod:
+                try:
+                    self.organizer.modDataChanged(backup_mod)
+                except Exception:
+                    pass
+            self.changed = True
+            frame.setEnabled(False)
+            QMessageBox.information(
+                self,
+                self.tr("DDS Deleted"),
+                self.tr(f"DDS moved to backup mod:\n{backup_mod_name}"),
+            )
+        except Exception as e:
+            QMessageBox.critical(self, self.tr("Error"), self.tr(f"Failed to delete DDS:\n{str(e)}"))
+
+    def _modRoot(self, mod_name: str) -> str:
+        try:
+            mod = self.organizer.modList().getMod(mod_name)
+            if mod:
+                return mod.absolutePath()
         except Exception:
             pass
-    
-    def _refreshBsaSection(self):
-        """Обновляет секцию BSA конфликтов"""
-        layout = self.bsa_section.layout()
-        self._clearLayout(layout)
-        
-        if not getattr(self.conflict_info, 'analysis_loaded', False):
-            lbl = QLabel(self.tr("The analysis is not loaded. Click 'Loaad Inf'."))
-            layout.addWidget(lbl)
-            return
-        
-        bsa_conflicts = self.conflict_info.bsa_conflicts or []
-        if not bsa_conflicts:
-            lbl = QLabel(self.tr("BSA archives were not found according to the analysis."))
-            layout.addWidget(lbl)
-            return
-        
-        group = QGroupBox(self.tr(f"BSA Archives ({len(bsa_conflicts)})"))
-        g_layout = QVBoxLayout()
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        content = QWidget()
-        s_layout = QVBoxLayout(content)
-        
-        for i, bsa_info in enumerate(bsa_conflicts):
-            bsa_widget = self._createBSAWidget(bsa_info, i + 1)
-            s_layout.addWidget(bsa_widget)
-        
-        s_layout.addStretch()
-        scroll.setWidget(content)
-        g_layout.addWidget(scroll, 1)
-        group.setLayout(g_layout)
-        layout.addWidget(group)
-    
-    def _refreshNifSection(self):
-        """Обновляет секцию NIF ссылок"""
-        layout = self.nif_section.layout()
-        self._clearLayout(layout)
-        
-        if not getattr(self.conflict_info, 'analysis_loaded', False):
-            lbl = QLabel(self.tr("To load data, click the button 'Load Inf'."))
-            layout.addWidget(lbl)
-            return
-        
-        nif_refs = self.conflict_info.nif_references or []
-        if not nif_refs:
-            lbl = QLabel(self.tr("There are no NIF files referencing this DDS based on the analysis."))
-            layout.addWidget(lbl)
-            return
-        
-        group = QGroupBox(self.tr(f"NIF Files Referencing This DDS ({len(nif_refs)})"))
-        g_layout = QVBoxLayout()
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        content = QWidget()
-        s_layout = QVBoxLayout(content)
-        
-        for i, nif_info in enumerate(nif_refs):
-            ref_widget = self._createNifWidget(nif_info, i + 1)
-            s_layout.addWidget(ref_widget)
-        
-        s_layout.addStretch()
-        scroll.setWidget(content)
-        g_layout.addWidget(scroll, 1)
-        group.setLayout(g_layout)
-        layout.addWidget(group)
-    
-    def _onScanClicked(self):
-        """Обработчик кнопки Scan: загружает JSON анализ и обновляет UI"""
-        if hasattr(self, 'scan_btn'):
-            self.scan_btn.setEnabled(False)
-            self.scan_btn.setText(self.tr("Scanning..."))
-        
-        # Временные заглушки "Загрузка..."
-        for section in (getattr(self, 'bsa_section', None), getattr(self, 'nif_section', None)):
-            if section is not None:
-                lay = section.layout()
-                self._clearLayout(lay)
-                lbl = QLabel(self.tr("Загрузка анализа из JSON..."))
-                lay.addWidget(lbl)
-        
+        return ""
+
+    def _notifyModChanged(self, mod_name: str):
         try:
-            # Загружаем анализ (использует кеш)
-            self.conflict_info.loadAnalysisData()
-        except Exception as e:
-            # Показываем ошибку
-            for section in (getattr(self, 'bsa_section', None), getattr(self, 'nif_section', None)):
-                if section is not None:
-                    lay = section.layout()
-                    self._clearLayout(lay)
-                    err = QLabel(self.tr(f"Ошибка загрузки анализа: {str(e)}"))
-                    lay.addWidget(err)
-            if hasattr(self, 'scan_btn'):
-                self.scan_btn.setEnabled(True)
-                self.scan_btn.setText(self.tr("Load Inf"))
+            mod = self.organizer.modList().getMod(mod_name)
+            if mod:
+                self.organizer.modDataChanged(mod)
+        except Exception:
+            pass
+
+    def _updateJson(self, mod_name: str, original_path: str, hidden_path: str):
+        root = self._modRoot(mod_name)
+        if not root:
             return
-        
-        # Обновляем секции с загруженными данными
-        self._refreshBsaSection()
-        self._refreshNifSection()
-        
-        if hasattr(self, 'scan_btn'):
-            self.scan_btn.setEnabled(True)
-            self.scan_btn.setText(self.tr("Rescan"))
-    
-    def _showPreview(self, file_info, parent_widget):
-        """Shows or hides file preview"""
-        preview_container = parent_widget.preview_container
-        preview_layout = parent_widget.preview_layout
-        preview_btn = parent_widget.preview_btn
-        
-        if preview_container.isVisible():
-            # Hide preview
-            preview_container.setVisible(False)
-            preview_btn.setText(self.tr("Preview"))
-            # Clean up content
-            while preview_layout.count():
-                item = preview_layout.takeAt(0)
-                if item.widget():
-                    widget = item.widget()
-                    try:
-                        if isinstance(widget, DDSWidget) and not widget.clean:
-                            widget.cleanup()
-                        widget.deleteLater()
-                    except (RuntimeError, SystemError, AttributeError) as e:
-                        print(f"DEBUG: Error cleaning up preview widget: {str(e)}")
-                    # Удаляем из списка отслеживания
-                    self.preview_widgets = [w for w in self.preview_widgets 
-                                          if (w() if isinstance(w, weakref.ref) else w) != widget]
-        else:
-            # Show preview
-            try:
-                file_path = file_info['path']
-                dds_file = DDSFile.fromFile(file_path)
-                dds_file.load()
-                
-                dds_widget = DDSWidget(dds_file, self.options, False)
-                dds_widget.setMinimumHeight(200)
-                dds_widget.setMaximumHeight(300)
-                
-                self.preview_widgets.append(weakref.ref(dds_widget))
-                
-                info_label = QLabel(self.tr("💡 Tip: Use mouse wheel to zoom, right/middle click + drag to pan, double-click to reset"))
-                preview_layout.addWidget(info_label)
-                
-                preview_layout.addWidget(dds_widget)
-                preview_container.setVisible(True)
-                preview_btn.setText(self.tr("Hide"))
-                
-            except Exception as e:
-                error_label = QLabel(self.tr(f"Error loading preview: {str(e)}"))
-                preview_layout.addWidget(error_label)
-                preview_container.setVisible(True)
-                preview_btn.setText(self.tr("Hide"))
-    
-    def _deleteFile(self, file_info, widget):
-        answer = QMessageBox.question(
-            self,
-            self.tr("Confirm Deletion"),
-            self.tr(f"Are you sure you want to delete the file from mod '{file_info['mod_name']}'?\n\n"
-                   f"A backup will be created for recovery."),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
-        )
-        
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        
-        backup_mod_name = time.strftime("DDSPreview_Backup_%Y_%m_%d_%H_%M_%S")
-        backup_mod = self.organizer.modList().getMod(backup_mod_name)
-        if not backup_mod:
-            backup_mod = self.organizer.createMod(
-                mobase.GuessedString(value=backup_mod_name, quality=mobase.GuessQuality.PRESET)
-            )
-        
-        backup_mod_path = backup_mod.absolutePath()
-        src_path = file_info['path']
-        dst_path = os.path.join(backup_mod_path, file_info['mod_name'], file_info['relative_path'])
-        
-        try:
-            # Cleanup all preview widgets BEFORE filesystem changes
-            self._cleanupPreviews()
-            
-            os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-            shutil.move(src_path, dst_path)
-            self._removeEmptyFoldersRecursive(
-                os.path.dirname(src_path),
-                file_info['mod'].absolutePath()
-            )
-            
-            self.deleted_files[file_info['path']] = {
-                'backup_path': dst_path,
-                'backup_mod': backup_mod,
-                'original_mod': file_info['mod']
-            }
-            
-            widget.setEnabled(False)
-            if hasattr(widget, 'delete_btn'):
-                widget.delete_btn.setText(self.tr("Deleted"))
-            
-            # Notify MO2 AFTER all cleanup and UI updates
-            self.organizer.modDataChanged(file_info['mod'])
-            self.organizer.modDataChanged(backup_mod)
-            
-            QMessageBox.information(
-                self,
-                self.tr("File Deleted"),
-                self.tr(f"File deleted and saved to backup mod:\n{backup_mod_name}")
-            )
-            
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                self.tr("Error"),
-                self.tr(f"Failed to delete file:\n{str(e)}")
-            )
-    
-    def _hideFile(self, file_info, widget):
-        answer = QMessageBox.question(
-            self,
-            self.tr("Confirm Hiding"),
-            self.tr(f"Are you sure you want to hide the file from mod '{file_info['mod_name']}'?\n\n"
-                   f"It will be renamed to '{os.path.basename(file_info['path'])}.mohidden'\n\n"
-                   f"Use 'DDS Hidden Files Manager' plugin to restore hidden files."),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
-        )
-        
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        
-        src_path = file_info['path']
-        dst_path = src_path + '.mohidden'
-        
-        try:
-            if os.path.exists(dst_path):
-                raise ValueError("Hidden file already exists.")
-            
-            # Cleanup all preview widgets BEFORE filesystem changes
-            self._cleanupPreviews()
-            
-            os.rename(src_path, dst_path)
-            self._removeEmptyFoldersRecursive(
-                os.path.dirname(src_path),
-                file_info['mod'].absolutePath()
-            )
-            
-            # Update JSON
-            self._updateJson(file_info['mod'], 'hide', src_path, dst_path)
-            
-            # Update UI
-            file_info['path'] = dst_path
-            file_info['is_hidden'] = True
-            widget.setEnabled(False)
-            if hasattr(widget, 'hide_btn'):
-                widget.hide_btn.setText(self.tr("Hidden"))
-                widget.hide_btn.setEnabled(False)
-            widget.findChild(QLabel).setText(widget.findChild(QLabel).text() + "<br>🔒 (Hidden)")
-            
-            # Notify MO2 AFTER all cleanup and UI updates
-            self.organizer.modDataChanged(file_info['mod'])
-            
-            QMessageBox.information(
-                self,
-                self.tr("File Hidden"),
-                self.tr(f"File hidden successfully!\n\n"
-                       f"Use 'DDS Hidden Files Manager' plugin (Tools menu) to restore it.")
-            )
-            
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                self.tr("Error"),
-                self.tr(f"Failed to hide file:\n{str(e)}")
-            )
-    
-    def _restoreFile(self, file_info, widget):
-        # This method is kept for future use but not exposed in UI
-        pass
-    
-    def _updateJson(self, mod, action, original_path, hidden_path):
-        json_path = os.path.join(mod.absolutePath(), 'dds_actions.json')
-        data = {'hidden': []}
+        json_path = os.path.join(root, "dds_actions.json")
+        data = {"hidden": []}
         if os.path.exists(json_path):
-            with open(json_path, 'r') as f:
-                data = json.load(f)
-        
-        hidden_list = data['hidden']
-        
-        if action == 'hide':
-            hidden_list.append({'original': original_path, 'hidden': hidden_path})
-        elif action == 'restore':
-            hidden_list = [h for h in hidden_list if h['hidden'] != hidden_path]
-        
-        data['hidden'] = hidden_list
-        
-        with open(json_path, 'w') as f:
-            json.dump(data, f, indent=4)
-    
+            try:
+                with open(json_path, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except Exception:
+                data = {"hidden": []}
+        hidden = data.setdefault("hidden", [])
+        hidden.append({"original": original_path, "hidden": hidden_path})
+        with open(json_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=4)
+
     def _removeEmptyFoldersRecursive(self, path, root):
-        if not os.path.exists(path):
+        if not path or not root or not os.path.exists(path):
             return
-        files = os.listdir(path)
-        for file_ in files:
-            child_path = os.path.join(path, file_)
+        root = os.path.abspath(root)
+        path = os.path.abspath(path)
+        if not path.startswith(root):
+            return
+        for child in list(os.listdir(path)):
+            child_path = os.path.join(path, child)
             if os.path.isdir(child_path):
                 self._removeEmptyFoldersRecursive(child_path, root)
-        files = os.listdir(path)
-        if len(files) == 0 and path != root:
-            try:
+        try:
+            if path != root and not os.listdir(path):
                 os.rmdir(path)
-            except:
-                pass
-    
-    def _formatSize(self, size):
-        for unit in ['B', 'KB', 'MB', 'GB']:
-            if size < 1024.0:
-                return f"{size:.2f} {unit}"
-            size /= 1024.0
-        return f"{size:.2f} TB"
-    
+        except Exception:
+            pass
+
     def tr(self, str_):
-        return QCoreApplication.translate("ConflictWidget", str_)
+        return QCoreApplication.translate("DdsManageFilesDialog", str_)
+
+
+class DdsPreviewWidget(QWidget):
+    SETTINGS_ORG = "xAI"
+    SETTINGS_APP = "DDSPreview"
+    SPLIT_KEY = "splitPreview"
+    SPLITTER_KEY = "dds_splitter_sizes"
+
+    def __init__(self, sources: DdsSourceSet, organizer, options: DDSOptions, channelManager: DDSChannelManager,
+                 plugin, file_name: str = "", file_data: bytes = b"", parent=None):
+        super().__init__(parent)
+        self.sources = sources
+        self.organizer = organizer
+        self.options = options
+        self.channelManager = channelManager
+        self.plugin = plugin
+        self.file_name = file_name
+        self.file_data = file_data or b""
+        self.settings = QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
+        self._syncing = False
+        self._chrome_guard = PreviewDialogChromeGuard(self)
+
+        self.setMinimumWidth(900)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(6)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(8)
+
+        self.reset_button = QPushButton(self.tr("Reset Camera"))
+        self.reset_button.clicked.connect(self.resetCameras)
+        toolbar.addWidget(self.reset_button)
+
+        self.split_check = QCheckBox(self.tr("Split Preview"))
+        self.split_check.setEnabled(len(self.sources.providers) > 1)
+        split_saved = self.settings.value(self.SPLIT_KEY, False, type=bool)
+        self.split_check.setChecked(bool(split_saved and len(self.sources.providers) > 1))
+        self.split_check.toggled.connect(self.setSplitPreview)
+        toolbar.addWidget(self.split_check)
+
+        self.sync_check = QCheckBox(self.tr("Sync Cameras"))
+        self.sync_check.setChecked(True)
+        toolbar.addWidget(self.sync_check)
+
+        self.find_refs_button = QPushButton(self.tr("Find NIF References"))
+        self.find_refs_button.clicked.connect(self.findNifReferences)
+        toolbar.addWidget(self.find_refs_button)
+
+        self.manage_button = QPushButton(self.tr("Manage Files..."))
+        self.manage_button.clicked.connect(self.manageFiles)
+        toolbar.addWidget(self.manage_button)
+
+        toolbar.addStretch()
+
+        self.channel_combo = QComboBox()
+        self._channel_keys = [e.name for e in ColourChannels]
+        self.channel_combo.addItems([e.value for e in ColourChannels])
+        self.channel_combo.setCurrentText(self.channelManager.channels.value)
+        self.channel_combo.currentIndexChanged.connect(self._onChannelChanged)
+        toolbar.addWidget(self.channel_combo)
+
+        self.background_button = QPushButton(self.tr("Pick background color"))
+        self.background_button.clicked.connect(self.pickBackgroundColour)
+        toolbar.addWidget(self.background_button)
+
+        layout.addLayout(toolbar)
+
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setHandleWidth(6)
+        self.left_pane = DdsPreviewPane(
+            self.tr("Active DDS"),
+            self.options,
+            self._logGlErrors(),
+            self.splitter,
+        )
+        self.right_pane = DdsPreviewPane(
+            self.tr("Compare DDS"),
+            self.options,
+            self._logGlErrors(),
+            self.splitter,
+        )
+        self.splitter.addWidget(self.left_pane)
+        self.splitter.addWidget(self.right_pane)
+        self.splitter.splitterMoved.connect(self._saveSplitterSizes)
+        layout.addWidget(self.splitter, 1)
+
+        self.footer = QLabel(self.tr(
+            "Use mouse wheel to zoom, right/middle button + drag to pan, double-click to reset."
+        ))
+        self.footer.setWordWrap(True)
+        layout.addWidget(self.footer)
+
+        self.left_pane.viewChanged.connect(lambda state: self._onPaneViewChanged(self.left_pane, self.right_pane, state))
+        self.right_pane.viewChanged.connect(lambda state: self._onPaneViewChanged(self.right_pane, self.left_pane, state))
+
+        self._loadPanes()
+        self.destroyed.connect(self._onDestroyed)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._chrome_guard.apply()
+
+    def closeEvent(self, event):
+        self._onDestroyed()
+        super().closeEvent(event)
+
+    def resetCameras(self):
+        if self.split_check.isChecked():
+            self.left_pane.resetView()
+            self.right_pane.resetView()
+        else:
+            self.left_pane.resetView()
+
+    def setSplitPreview(self, enabled: bool):
+        enabled = bool(enabled and len(self.sources.providers) > 1)
+        if self.split_check.isChecked() != enabled:
+            self.split_check.blockSignals(True)
+            self.split_check.setChecked(enabled)
+            self.split_check.blockSignals(False)
+        self.settings.setValue(self.SPLIT_KEY, enabled)
+        self.right_pane.setVisible(enabled)
+        self.sync_check.setVisible(enabled)
+        self.reset_button.setText(self.tr("Reset Cameras" if enabled else "Reset Camera"))
+        if enabled and isinstance(self.left_pane.current_widget, DDSWidget):
+            self.right_pane.setViewState(self.left_pane.currentViewState())
+        self._restoreSplitterSizes()
+
+    def findNifReferences(self):
+        provider = self.left_pane.currentProvider() or self.sources.current_provider()
+        query = ""
+        if provider is not None:
+            query = normalize_data_path(provider.virtual_path or provider.filename)
+        else:
+            query = normalize_data_path(self.sources.virtual_path or self.file_name)
+
+        app = QApplication.instance()
+        bridge = getattr(app, "ump_find_nif_references", None) if app else None
+        if not callable(bridge):
+            QMessageBox.information(
+                self,
+                self.tr("UMP Required"),
+                self.tr("Find NIF References requires Ultimate Mod Panel to be installed and enabled."),
+            )
+            return
+
+        try:
+            handled = bool(bridge(query))
+        except Exception as e:
+            QMessageBox.warning(self, self.tr("UMP Error"), self.tr(f"UMP could not start the search:\n{str(e)}"))
+            return
+
+        if not handled:
+            QMessageBox.information(
+                self,
+                self.tr("UMP Unavailable"),
+                self.tr("UMP is enabled, but its NIF <-> DDS search tab is unavailable."),
+            )
+
+    def manageFiles(self):
+        dialog = DdsManageFilesDialog(self.organizer, self.sources, self)
+        dialog.exec()
+        if dialog.changed:
+            self.refreshSources()
+
+    def refreshSources(self):
+        self.sources = resolve_dds_sources(self.organizer, self.file_name, self.file_data)
+        self.split_check.setEnabled(len(self.sources.providers) > 1)
+        if len(self.sources.providers) < 2:
+            self.split_check.setChecked(False)
+        self._loadPanes()
+
+    def pickBackgroundColour(self):
+        newColour = QColorDialog.getColor(
+            self.options.getBackgroundColour(),
+            self,
+            self.tr("Background color"),
+            QColorDialog.ColorDialogOption.ShowAlphaChannel,
+        )
+        if not newColour.isValid():
+            return
+        if self.options.getBackgroundColour().alpha() == 0:
+            newColour.setAlpha(255)
+        self.plugin.setPluginSetting("background r", newColour.red())
+        self.plugin.setPluginSetting("background g", newColour.green())
+        self.plugin.setPluginSetting("background b", newColour.blue())
+        self.plugin.setPluginSetting("background a", newColour.alpha())
+        self.options.setBackgroundColour(newColour)
+        self._updatePanes()
+
+    def _onChannelChanged(self, newIndex: int):
+        if not (0 <= newIndex < len(self._channel_keys)):
+            return
+        channels = ColourChannels[self._channel_keys[newIndex]]
+        self.channelManager.setChannels(self.options, channels)
+        self.plugin.setPluginSetting("channels", self.channelManager.channels.name)
+        self._updatePanes()
+
+    def _loadPanes(self):
+        current = self.sources.current_index
+        self.left_pane.setSources(self.sources, current)
+
+        compare = 0
+        if len(self.sources.providers) > 1:
+            compare = 1 if current == 0 else 0
+        self.right_pane.setSources(self.sources, compare)
+        self.setSplitPreview(self.split_check.isChecked())
+
+    def _updatePanes(self):
+        self.left_pane.updateRenderOptions()
+        self.right_pane.updateRenderOptions()
+
+    def _onPaneViewChanged(self, source: DdsPreviewPane, target: DdsPreviewPane, state):
+        if self._syncing or not self.split_check.isChecked() or not self.sync_check.isChecked():
+            return
+        self._syncing = True
+        try:
+            target.setViewState(state, emit_signal=False)
+        finally:
+            self._syncing = False
+
+    def _restoreSplitterSizes(self):
+        values = self.settings.value(self.SPLITTER_KEY, [int(self.width() / 2), int(self.width() / 2)])
+        try:
+            values = [int(value) for value in values]
+            if len(values) == 2 and all(value > 0 for value in values):
+                self.splitter.setSizes(values)
+        except Exception:
+            self.splitter.setSizes([1, 1])
+
+    def _saveSplitterSizes(self, *args):
+        self.settings.setValue(self.SPLITTER_KEY, [int(value) for value in self.splitter.sizes()])
+
+    def _logGlErrors(self):
+        try:
+            return bool(self.plugin.pluginSetting("log gl errors"))
+        except Exception:
+            return False
+
+    def _onDestroyed(self, *args):
+        try:
+            self._saveSplitterSizes()
+        except Exception:
+            pass
+        try:
+            self.left_pane.cleanup()
+            self.right_pane.cleanup()
+        except Exception:
+            pass
+        self._chrome_guard.restore()
+
+    def tr(self, str_):
+        return QCoreApplication.translate("DdsPreviewWidget", str_)
 
 
 class DDSPreview(mobase.IPluginPreview):
-    # Статические переменные для кеширования NifDDsaddiction.json
-    _nif_addiction_cache = None
-    _nif_addiction_cache_mtime = None
-    _nif_addiction_cache_path = None
-    
     def __init__(self):
         super().__init__()
         self.__organizer = None
@@ -1336,57 +1322,6 @@ class DDSPreview(mobase.IPluginPreview):
     def setPluginSetting(self, name, value):
         self.__organizer.setPluginSetting(self.name(), name, value)
 
-    @classmethod
-    def getNifAddictionData(cls, organizer=None):
-        """
-        Получает данные NifDDsaddiction.json с кешированием.
-        Загружает файл только при первом обращении или если файл изменился.
-        """
-        import os
-        import json
-        
-        # Определяем путь к JSON: сначала в папке плагина, затем в папке модов MO2
-        plugin_json_path = os.path.join(os.path.dirname(__file__), "NifDDsaddiction.json")
-        candidates = [plugin_json_path]
-        if organizer:
-            candidates.append(os.path.join(organizer.modsPath(), "NifDDsaddiction.json"))
-        
-        json_path = None
-        for p in candidates:
-            if os.path.exists(p):
-                json_path = p
-                break
-        
-        if json_path is None:
-            return {}
-        
-        try:
-            
-            # Получаем время модификации файла
-            current_mtime = os.path.getmtime(json_path)
-            
-            # Проверяем, нужно ли обновить кеш
-            if (cls._nif_addiction_cache is None or 
-                cls._nif_addiction_cache_path != json_path or
-                cls._nif_addiction_cache_mtime != current_mtime):
-                
-                # Загружаем данные из файла
-                with open(json_path, 'r', encoding='utf-8') as f:
-                    cls._nif_addiction_cache = json.load(f)
-                
-                # Обновляем метаданные кеша
-                cls._nif_addiction_cache_mtime = current_mtime
-                cls._nif_addiction_cache_path = json_path
-            
-            return cls._nif_addiction_cache
-            
-        except FileNotFoundError:
-            return {}
-        except json.JSONDecodeError:
-            return {}
-        except Exception:
-            return {}
-
     def name(self):
         return "DDS Preview Plugin"
 
@@ -1394,12 +1329,11 @@ class DDSPreview(mobase.IPluginPreview):
         return "AnyOldName3"
 
     def description(self):
-        return self.tr("Lets you preview DDS files by uploading them to the GPU. "
-                      "Shows file conflicts and allows conflict management. "
-                      "Use mouse wheel to zoom, right/middle click + drag to pan.")
+        return self.tr("NIF-style DDS preview with split comparison, source cycling, "
+                      "BSA-aware conflict providers, and UMP NIF reference handoff.")
 
     def version(self):
-        return mobase.VersionInfo(1, 3, 0, 0)
+        return mobase.VersionInfo(2, 0, 0, 0)
 
     def settings(self):
         return [
@@ -1416,10 +1350,7 @@ class DDSPreview(mobase.IPluginPreview):
                 self.tr("Alpha channel of background color"), 0),
             mobase.PluginSetting("channels", 
                 self.tr("The color channels that are displayed."),
-                ColourChannels.RGBA.name),
-            mobase.PluginSetting("show conflicts", 
-                self.tr("Show file conflicts information"), 
-                True)
+                ColourChannels.RGBA.name)
         ]
 
     def supportedExtensions(self):
@@ -1428,318 +1359,52 @@ class DDSPreview(mobase.IPluginPreview):
     def supportsArchives(self) -> bool:
         return True
 
+    def __makePreviewWidget(self, source_set: DdsSourceSet, file_name: str, file_data: bytes = b"") -> QWidget:
+        if not source_set.providers:
+            error_widget = QLabel(self.tr("No DDS providers found for this preview."))
+            error_widget.setWordWrap(True)
+            return error_widget
+
+        widget = DdsPreviewWidget(
+            source_set,
+            self.__organizer,
+            self.options,
+            self.channelManager,
+            self,
+            file_name,
+            file_data,
+        )
+        self.active_widgets.append(weakref.ref(widget))
+
+        def cleanup_on_destroy(*args):
+            self.active_widgets = [
+                ref for ref in self.active_widgets
+                if (ref() if isinstance(ref, weakref.ref) else ref) is not None
+            ]
+
+        widget.destroyed.connect(cleanup_on_destroy)
+        return widget
+
     def genFilePreview(self, fileName: str, maxSize: QSize) -> QWidget:
         print(f"DEBUG: genFilePreview called, organizer = {self.__organizer}")
         print(f"DEBUG: fileName = {fileName}, type = {type(fileName)}")
-    
+
         if not fileName or not isinstance(fileName, str):
             error_widget = QLabel(self.tr(f"Error: Invalid file path provided: {fileName}"))
             error_widget.setWordWrap(True)
             return error_widget
-    
-        try:
-            ddsFile = DDSFile.fromFile(fileName)
-            ddsFile.load()
-        except Exception as e:
-            error_widget = QLabel(self.tr(f"Error loading DDS file:\n{str(e)}"))
-            error_widget.setWordWrap(True)
-            return error_widget
-    
-        # Use QSplitter instead of QHBoxLayout
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setHandleWidth(6)
-    
-        # Left column: conflicts
-        left_widget = QWidget()
-        left_layout = QVBoxLayout()
-        left_widget.setLayout(left_layout)
-        splitter.addWidget(left_widget)
-    
-        # Right column: preview
-        right_widget = QWidget()
-        right_layout = QVBoxLayout()
-        image_layout = QGridLayout()
-        image_layout.setRowStretch(0, 1)
-        image_layout.setColumnStretch(0, 1)
-    
-        ddsWidget = DDSWidget(ddsFile, self.options, 
-                             self.__organizer.pluginSetting(self.name(), "log gl errors") if self.__organizer else False)
-    
-        self.active_widgets.append(weakref.ref(ddsWidget))
-    
-        image_layout.addWidget(ddsWidget, 0, 0, 1, 3)
-    
-        zoom_info = QLabel(self.tr("💡 Use mouse wheel to zoom, right/middle button + drag to pan, double-click to reset"))
-        zoom_info.setWordWrap(True)
-        image_layout.addWidget(zoom_info, 1, 0, 1, 3)
-    
-        image_layout.addWidget(self.__makeLabel(ddsFile), 2, 0, 1, 1)
-        image_layout.addWidget(self.__makeChannelsButton(ddsWidget), 2, 1, 1, 1)
-        image_layout.addWidget(self.__makeColourButton(ddsWidget), 2, 2, 1, 1)
-        image_layout.addWidget(self.__makeDeepScanButton(), 2, 3, 1, 1)
-        image_layout.addWidget(self.__makeDeepScanButton(), 2, 3, 1, 1)
-    
-        right_layout.addLayout(image_layout)
-        right_widget.setLayout(right_layout)
-        splitter.addWidget(right_widget)
-    
-        # Add conflicts to left column
-        if self.__organizer and self.__organizer.pluginSetting(self.name(), "show conflicts"):
-            conflict_info = ConflictInfo(self.__organizer, fileName)
-            if conflict_info.conflicts:
-                conflict_widget = ConflictWidget(self.__organizer, conflict_info, self.options)
-                left_layout.addWidget(conflict_widget)
-    
-        # Restore splitter sizes from settings
-        settings = QSettings("xAI", "DDSPreview")
-        splitter_sizes = settings.value("dds_preview_splitter_sizes", [300, 600])
-        try:
-            # Ensure sizes are integers
-            splitter_sizes = [int(size) for size in splitter_sizes]
-        except (TypeError, ValueError) as e:
-            print(f"DEBUG: Invalid splitter sizes {splitter_sizes}, using default: {e}")
-            splitter_sizes = [300, 600]  # Fallback to default
-        splitter.setSizes(splitter_sizes)
-    
-        widget = QWidget()
-        main_layout = QVBoxLayout()
-        main_layout.addWidget(splitter)
-        widget.setLayout(main_layout)
-        widget.setMinimumWidth(900)
-    
-        # Save splitter sizes on destroy
-        def save_splitter_sizes():
-            settings.setValue("dds_preview_splitter_sizes", [int(size) for size in splitter.sizes()])
-    
-        widget.destroyed.connect(save_splitter_sizes)
-    
-        def cleanup_on_destroy():
-            self.active_widgets = [w for w in self.active_widgets 
-                                  if (w() if isinstance(w, weakref.ref) else w) is not None]
-    
-        widget.destroyed.connect(cleanup_on_destroy)
-    
-        return widget
+
+        source_set = resolve_dds_sources(self.__organizer, fileName, b"")
+        return self.__makePreviewWidget(source_set, fileName, b"")
 
     def genDataPreview(self, fileData: bytes, fileName: str, maxSize: QSize) -> QWidget:
-        print(f"DEBUG: genDataPreview called, fileName = {fileName}, data length = {len(fileData)}")
-    
-        try:
-            ddsFile = DDSFile(fileData, fileName)
-            ddsFile.load()
-        except Exception as e:
-            error_widget = QLabel(self.tr(f"Error loading DDS file:\n{str(e)}"))
-            error_widget.setWordWrap(True)
-            return error_widget
-    
-        # Use QSplitter instead of QHBoxLayout
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setHandleWidth(6)
-    
-        # Left column: conflicts
-        left_widget = QWidget()
-        left_layout = QVBoxLayout()
-        left_widget.setLayout(left_layout)
-        splitter.addWidget(left_widget)
-    
-        # Right column: preview
-        right_widget = QWidget()
-        right_layout = QVBoxLayout()
-        image_layout = QGridLayout()
-        image_layout.setRowStretch(0, 1)
-        image_layout.setColumnStretch(0, 1)
-    
-        ddsWidget = DDSWidget(ddsFile, self.options, 
-                             self.__organizer.pluginSetting(self.name(), "log gl errors") if self.__organizer else False)
-    
-        self.active_widgets.append(weakref.ref(ddsWidget))
-    
-        image_layout.addWidget(ddsWidget, 0, 0, 1, 3)
-    
-        zoom_info = QLabel(self.tr("💡 Use mouse wheel to zoom, right/middle button + drag to pan, double-click to reset"))
-        zoom_info.setWordWrap(True)
-        image_layout.addWidget(zoom_info, 1, 0, 1, 3)
-    
-        image_layout.addWidget(self.__makeLabel(ddsFile), 2, 0, 1, 1)
-        image_layout.addWidget(self.__makeChannelsButton(ddsWidget), 2, 1, 1, 1)
-        image_layout.addWidget(self.__makeColourButton(ddsWidget), 2, 2, 1, 1)
-    
-        right_layout.addLayout(image_layout)
-        right_widget.setLayout(right_layout)
-        splitter.addWidget(right_widget)
-    
-        # Add conflicts to left column
-        if self.__organizer and self.__organizer.pluginSetting(self.name(), "show conflicts"):
-            conflict_info = ConflictInfo(self.__organizer, fileName)
-            if conflict_info.conflicts:
-                conflict_widget = ConflictWidget(self.__organizer, conflict_info, self.options)
-                left_layout.addWidget(conflict_widget)
-    
-        # Restore splitter sizes from settings
-        settings = QSettings("xAI", "DDSPreview")
-        splitter_sizes = settings.value("dds_preview_splitter_sizes", [300, 600])
-        try:
-            # Ensure sizes are integers
-            splitter_sizes = [int(size) for size in splitter_sizes]
-        except (TypeError, ValueError) as e:
-            print(f"DEBUG: Invalid splitter sizes {splitter_sizes}, using default: {e}")
-            splitter_sizes = [300, 600]  # Fallback to default
-        splitter.setSizes(splitter_sizes)
-    
-        widget = QWidget()
-        main_layout = QVBoxLayout()
-        main_layout.addWidget(splitter)
-        widget.setLayout(main_layout)
-        widget.setMinimumWidth(900)
-    
-        # Save splitter sizes on destroy
-        def save_splitter_sizes():
-            settings.setValue("dds_preview_splitter_sizes", [int(size) for size in splitter.sizes()])
-    
-        widget.destroyed.connect(save_splitter_sizes)
-    
-        def cleanup_on_destroy():
-            self.active_widgets = [w for w in self.active_widgets 
-                                   if (w() if isinstance(w, weakref.ref) else w) is not None]
-
-        widget.destroyed.connect(cleanup_on_destroy)
-
-        # Обработка размеров splitter
-        try:
-            splitter_sizes = [int(size) for size in splitter_sizes]
-        except (TypeError, ValueError) as e:
-            print(f"DEBUG: Invalid splitter sizes {splitter_sizes}, using default: {e}")
-            splitter_sizes = [300, 600]  # Fallback to default
-
-        splitter.setSizes(splitter_sizes)
-
-        # Создание виджета
-        widget = QWidget()
-        main_layout = QVBoxLayout()
-        main_layout.addWidget(splitter)
-        widget.setLayout(main_layout)
-        widget.setMinimumWidth(900)
-
-        return widget
-
-    
-        # Save splitter sizes on destroy
-        def save_splitter_sizes():
-            settings.setValue("dds_preview_splitter_sizes", [int(size) for size in splitter.sizes()])
-    
-        widget.destroyed.connect(save_splitter_sizes)
-    
-        def cleanup_on_destroy():
-            self.active_widgets = [w for w in self.active_widgets 
-                                  if (w() if isinstance(w, weakref.ref) else w) is not None]
-    
-        widget.destroyed.connect(cleanup_on_destroy)
-    
-        return widget
+        data = bytes(fileData or b"")
+        print(f"DEBUG: genDataPreview called, fileName = {fileName}, data length = {len(data)}")
+        source_set = resolve_dds_sources(self.__organizer, fileName, data)
+        return self.__makePreviewWidget(source_set, fileName, data)
 
     def tr(self, str):
         return QCoreApplication.translate("DDSPreview", str)
-
-    def __makeLabel(self, ddsFile):
-        label = QLabel(ddsFile.getDescription())
-        label.setWordWrap(True)
-        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        return label
-
-    def __makeColourButton(self, ddsWidget):
-        button = QPushButton(self.tr("Pick background color"))
-
-        def pickColour(unused):
-            newColour = QColorDialog.getColor(
-                self.options.getBackgroundColour(), 
-                button, 
-                "Background color",
-                QColorDialog.ColorDialogOption.ShowAlphaChannel
-            )
-            if newColour.isValid():
-                # Если текущий фон полностью прозрачный, принудительно выставим альфу 255,
-                # чтобы выбранный цвет был видим.
-                current_bg = self.options.getBackgroundColour()
-                if current_bg and current_bg.alpha() == 0:
-                    newColour.setAlpha(255)
-
-                # Сохраняем настройки плагина
-                self.setPluginSetting("background r", newColour.red())
-                self.setPluginSetting("background g", newColour.green())
-                self.setPluginSetting("background b", newColour.blue())
-                self.setPluginSetting("background a", newColour.alpha())
-
-                # Применяем цвет в опциях
-                self.options.setBackgroundColour(newColour)
-
-                # Обновляем конкретный виджет
-                try:
-                    ddsWidget.update()
-                except Exception:
-                    pass
-
-                # Обновляем все активные DDS-виджеты, если они отслеживаются
-                for widget_ref in getattr(self, 'active_widgets', []):
-                    widget = widget_ref() if isinstance(widget_ref, weakref.ref) else widget_ref
-                    if widget is not None:
-                        try:
-                            widget.update()
-                        except Exception:
-                            pass
-
-        button.clicked.connect(pickColour)
-        return button
-
-    def __makeChannelsButton(self, ddsWidget):
-        listwidget = QComboBox()
-        channelKeys = [e.name for e in ColourChannels]
-        channelNames = [e.value for e in ColourChannels]
-
-        listwidget.addItems(channelNames)
-        listwidget.setCurrentText(self.channelManager.channels.value)
-        listwidget.setToolTip(self.tr("Select what color channels are displayed."))
-
-        listwidget.showEvent = lambda _: listwidget.setCurrentText(self.channelManager.channels.value)
-
-        def onChanged(newIndex):
-            self.channelManager.setChannels(self.options, ColourChannels[channelKeys[newIndex]])
-            self.setPluginSetting("channels", self.channelManager.channels.name)
-            ddsWidget.update()
-
-        listwidget.currentIndexChanged.connect(onChanged)
-        return listwidget
-
-    def __runDeepScan(self):
-        """Запускает nifddsparser.exe с путем к папке модов"""
-        try:
-            # Получаем путь к папке плагинов
-            plugin_folder = os.path.dirname(os.path.abspath(__file__))
-            nifddsparser_path = os.path.join(plugin_folder, "nifddsparser.exe")
-            
-            # Получаем путь к папке модов через MO2 API
-            mods_path = self.__organizer.modsPath()
-            
-            # Проверяем существование nifddsparser.exe
-            if not os.path.exists(nifddsparser_path):
-                QMessageBox.warning(None, self.tr("Error"), 
-                                  self.tr(f"nifddsparser.exe not found at: {nifddsparser_path}"))
-                return
-            
-            # Запускаем nifddsparser.exe с путем к модам как аргументом
-            subprocess.Popen([nifddsparser_path, mods_path], 
-                           creationflags=subprocess.CREATE_NEW_CONSOLE)
-            
-        except Exception as e:
-             QMessageBox.critical(None, self.tr("Error"), 
-                                self.tr(f"Failed to run Deep Scan: {str(e)}"))
-
-    def __makeDeepScanButton(self):
-        """Создает кнопку Deep Scan для запуска nifddsparser.exe"""
-        button = QPushButton(self.tr("Deep Scan"))
-        button.setToolTip(self.tr("Run deep scan analysis using nifddsparser.exe"))
-        button.clicked.connect(self.__runDeepScan)
-        return button
-
 
 def createPlugin():
     return DDSPreview()
