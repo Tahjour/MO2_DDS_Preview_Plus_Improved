@@ -118,6 +118,15 @@ def virtual_path_for(organizer, file_name: str) -> str:
         pass
 
     try:
+        mods_path = Path(organizer.modsPath())
+        relative = file_path.resolve().relative_to(mods_path.resolve())
+        parts = relative.parts
+        if len(parts) > 1:
+            return normalize_data_path(str(Path(*parts[1:])))
+    except Exception:
+        pass
+
+    try:
         mod_list = organizer.modList()
         for mod_name in _mod_names_by_priority(mod_list):
             mod = mod_list.getMod(mod_name)
@@ -126,15 +135,6 @@ def virtual_path_for(organizer, file_name: str) -> str:
             relative = _relative_to_base(Path(mod.absolutePath()), file_path)
             if relative:
                 return relative
-    except Exception:
-        pass
-
-    try:
-        mods_path = Path(organizer.modsPath())
-        relative = file_path.resolve().relative_to(mods_path.resolve())
-        parts = relative.parts
-        if len(parts) > 1:
-            return normalize_data_path(str(Path(*parts[1:])))
     except Exception:
         pass
 
@@ -348,7 +348,12 @@ def _provider_index_for_data(providers: list[DdsSourceProvider], data: bytes) ->
     return -1
 
 
-def resolve_dds_sources(organizer, file_name: str, file_data: bytes | None = None) -> DdsSourceSet:
+def resolve_dds_sources(
+    organizer,
+    file_name: str,
+    file_data: bytes | None = None,
+    include_archives: bool = True,
+) -> DdsSourceSet:
     file_data = file_data or b""
     virtual_path = virtual_path_for(organizer, file_name)
     providers: list[DdsSourceProvider] = []
@@ -364,20 +369,23 @@ def resolve_dds_sources(organizer, file_name: str, file_data: bytes | None = Non
                 loose = _loose_provider(mod_list, mod_name, mod, virtual_path)
                 if loose:
                     _add_provider(providers, loose)
-                _add_mod_archives(providers, mod_list, mod_name, mod, virtual_path)
+                if include_archives:
+                    _add_mod_archives(providers, mod_list, mod_name, mod, virtual_path)
 
-            for mod_name in _mod_names_by_priority(mod_list):
-                if not _mod_exists(mod_list, mod_name):
-                    continue
-                mod = mod_list.getMod(mod_name)
-                if not mod:
-                    continue
-                _add_mod_archives(providers, mod_list, mod_name, mod, virtual_path)
+            if include_archives:
+                for mod_name in _mod_names_by_priority(mod_list):
+                    if not _mod_exists(mod_list, mod_name):
+                        continue
+                    mod = mod_list.getMod(mod_name)
+                    if not mod:
+                        continue
+                    _add_mod_archives(providers, mod_list, mod_name, mod, virtual_path)
         except Exception:
             pass
 
-        for archive_path in _archive_paths_from_game(organizer):
-            _add_archive_provider(providers, GAME_DATA_OWNER, GAME_DATA_OWNER, virtual_path, archive_path, True)
+        if include_archives:
+            for archive_path in _archive_paths_from_game(organizer):
+                _add_archive_provider(providers, GAME_DATA_OWNER, GAME_DATA_OWNER, virtual_path, archive_path, True)
 
     current_index = 0
     if file_data:

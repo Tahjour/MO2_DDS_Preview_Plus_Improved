@@ -7,13 +7,14 @@ import time
 import weakref
 import json
 
-from PyQt6.QtCore import QCoreApplication, qDebug, Qt, QPoint, QSize, QSettings, pyqtSignal
+from PyQt6.QtCore import QCoreApplication, qDebug, Qt, QPoint, QSize, QSettings, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QOpenGLContext, QSurfaceFormat, QMatrix4x4, QVector4D, QWheelEvent, QMouseEvent
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtWidgets import (QCheckBox, QDialog, QLabel, QPushButton, QWidget, 
                              QColorDialog, QComboBox, QVBoxLayout, QHBoxLayout,
                              QMessageBox, QScrollArea, QFrame, QSplitter,
-                             QToolButton, QApplication)
+                             QToolButton, QApplication, QLineEdit, QRadioButton,
+                             QTabWidget)
 from PyQt6.QtOpenGL import QOpenGLBuffer, QOpenGLDebugLogger, QOpenGLShader, QOpenGLShaderProgram, QOpenGLTexture, \
     QOpenGLVersionProfile, QOpenGLVertexArrayObject, QOpenGLVersionFunctionsFactory
 
@@ -1021,6 +1022,30 @@ class DdsManageFilesDialog(QDialog):
         return QCoreApplication.translate("DdsManageFilesDialog", str_)
 
 
+class DdsSourceResolveWorker(QThread):
+    resolved = pyqtSignal(object, int)
+    failed = pyqtSignal(str, int)
+
+    def __init__(self, organizer, file_name: str, file_data: bytes, generation: int, parent=None):
+        super().__init__(parent)
+        self.organizer = organizer
+        self.file_name = file_name
+        self.file_data = file_data or b""
+        self.generation = generation
+
+    def run(self):
+        try:
+            sources = resolve_dds_sources(
+                self.organizer,
+                self.file_name,
+                self.file_data,
+                include_archives=True,
+            )
+            self.resolved.emit(sources, self.generation)
+        except Exception as e:
+            self.failed.emit(str(e), self.generation)
+
+
 class DdsPreviewWidget(QWidget):
     SETTINGS_ORG = "xAI"
     SETTINGS_APP = "DDSPreview"
@@ -1040,6 +1065,11 @@ class DdsPreviewWidget(QWidget):
         self.settings = QSettings(self.SETTINGS_ORG, self.SETTINGS_APP)
         self._syncing = False
         self._chrome_guard = PreviewDialogChromeGuard(self)
+        self._archive_worker = None
+        self._source_generation = 0
+        self._base_footer_text = self.tr(
+            "Use mouse wheel to zoom, right/middle button + drag to pan, double-click to reset."
+        )
 
         self.setMinimumWidth(900)
 
@@ -1107,9 +1137,7 @@ class DdsPreviewWidget(QWidget):
         self.splitter.splitterMoved.connect(self._saveSplitterSizes)
         layout.addWidget(self.splitter, 1)
 
-        self.footer = QLabel(self.tr(
-            "Use mouse wheel to zoom, right/middle button + drag to pan, double-click to reset."
-        ))
+        self.footer = QLabel(self._base_footer_text)
         self.footer.setWordWrap(True)
         layout.addWidget(self.footer)
 
@@ -1117,6 +1145,7 @@ class DdsPreviewWidget(QWidget):
         self.right_pane.viewChanged.connect(lambda state: self._onPaneViewChanged(self.right_pane, self.left_pane, state))
 
         self._loadPanes()
+        self._startArchiveResolve()
         self.destroyed.connect(self._onDestroyed)
 
     def showEvent(self, event):
@@ -1135,12 +1164,14 @@ class DdsPreviewWidget(QWidget):
             self.left_pane.resetView()
 
     def setSplitPreview(self, enabled: bool):
-        enabled = bool(enabled and len(self.sources.providers) > 1)
+        split_available = len(self.sources.providers) > 1
+        enabled = bool(enabled and split_available)
         if self.split_check.isChecked() != enabled:
             self.split_check.blockSignals(True)
             self.split_check.setChecked(enabled)
             self.split_check.blockSignals(False)
-        self.settings.setValue(self.SPLIT_KEY, enabled)
+        if split_available:
+            self.settings.setValue(self.SPLIT_KEY, enabled)
         self.right_pane.setVisible(enabled)
         self.sync_check.setVisible(enabled)
         self.reset_button.setText(self.tr("Reset Cameras" if enabled else "Reset Camera"))
@@ -1159,6 +1190,10 @@ class DdsPreviewWidget(QWidget):
         app = QApplication.instance()
         bridge = getattr(app, "ump_find_nif_references", None) if app else None
         if not callable(bridge):
+            bridge = self._findLiveUmpBridge()
+        if not callable(bridge):
+            if self._driveUmpSearchUi(query):
+                return
             QMessageBox.information(
                 self,
                 self.tr("UMP Required"),
@@ -1173,11 +1208,12 @@ class DdsPreviewWidget(QWidget):
             return
 
         if not handled:
-            QMessageBox.information(
-                self,
-                self.tr("UMP Unavailable"),
-                self.tr("UMP is enabled, but its NIF <-> DDS search tab is unavailable."),
-            )
+            if not self._driveUmpSearchUi(query):
+                QMessageBox.information(
+                    self,
+                    self.tr("UMP Unavailable"),
+                    self.tr("UMP is enabled, but its NIF <-> DDS search tab is unavailable."),
+                )
 
     def manageFiles(self):
         dialog = DdsManageFilesDialog(self.organizer, self.sources, self)
@@ -1186,11 +1222,17 @@ class DdsPreviewWidget(QWidget):
             self.refreshSources()
 
     def refreshSources(self):
-        self.sources = resolve_dds_sources(self.organizer, self.file_name, self.file_data)
+        self.sources = resolve_dds_sources(
+            self.organizer,
+            self.file_name,
+            self.file_data,
+            include_archives=False,
+        )
         self.split_check.setEnabled(len(self.sources.providers) > 1)
         if len(self.sources.providers) < 2:
             self.split_check.setChecked(False)
         self._loadPanes()
+        self._startArchiveResolve()
 
     def pickBackgroundColour(self):
         newColour = QColorDialog.getColor(
@@ -1218,13 +1260,17 @@ class DdsPreviewWidget(QWidget):
         self.plugin.setPluginSetting("channels", self.channelManager.channels.name)
         self._updatePanes()
 
-    def _loadPanes(self):
-        current = self.sources.current_index
+    def _loadPanes(self, left_key=None, right_key=None):
+        current = self._indexForProviderKey(left_key)
+        if current < 0:
+            current = self.sources.current_index
         self.left_pane.setSources(self.sources, current)
 
-        compare = 0
-        if len(self.sources.providers) > 1:
-            compare = 1 if current == 0 else 0
+        compare = self._indexForProviderKey(right_key)
+        if compare < 0:
+            compare = 0
+            if len(self.sources.providers) > 1:
+                compare = 1 if current == 0 else 0
         self.right_pane.setSources(self.sources, compare)
         self.setSplitPreview(self.split_check.isChecked())
 
@@ -1253,6 +1299,160 @@ class DdsPreviewWidget(QWidget):
     def _saveSplitterSizes(self, *args):
         self.settings.setValue(self.SPLITTER_KEY, [int(value) for value in self.splitter.sizes()])
 
+    def _providerKey(self, provider):
+        if provider is None:
+            return ""
+        return "|".join([
+            provider.source_kind,
+            normalize_data_path(provider.virtual_path or provider.filename),
+            str(provider.physical_path or "").lower(),
+            str(provider.archive_path or "").lower(),
+            str(provider.display_name or ""),
+        ])
+
+    def _indexForProviderKey(self, key: str) -> int:
+        if not key:
+            return -1
+        for index, provider in enumerate(self.sources.providers):
+            if self._providerKey(provider) == key:
+                return index
+        return -1
+
+    def _startArchiveResolve(self):
+        if self.organizer is None:
+            return
+        if not (self.file_name or self.file_data):
+            return
+        if self._archive_worker is not None and self._archive_worker.isRunning():
+            return
+
+        self._source_generation += 1
+        generation = self._source_generation
+        worker = DdsSourceResolveWorker(
+            self.organizer,
+            self.file_name,
+            self.file_data,
+            generation,
+            None,
+        )
+        self._archive_worker = worker
+        app = QApplication.instance()
+        if app is not None:
+            keepers = getattr(app, "_dds_preview_source_workers", [])
+            keepers.append(worker)
+            setattr(app, "_dds_preview_source_workers", keepers)
+
+            def release_worker():
+                try:
+                    keepers.remove(worker)
+                except ValueError:
+                    pass
+
+            worker.finished.connect(release_worker)
+        self.footer.setText(self._base_footer_text + " " + self.tr("Loading BSA sources..."))
+        worker.resolved.connect(self._onArchiveSourcesResolved)
+        worker.failed.connect(self._onArchiveSourcesFailed)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _onArchiveSourcesResolved(self, source_set: DdsSourceSet, generation: int):
+        if generation != self._source_generation:
+            return
+        left_key = self._providerKey(self.left_pane.currentProvider())
+        right_key = self._providerKey(self.right_pane.currentProvider())
+        left_state = self.left_pane.currentViewState()
+        right_state = self.right_pane.currentViewState()
+        split_was_enabled = self.split_check.isChecked() or bool(
+            self.settings.value(self.SPLIT_KEY, False, type=bool)
+        )
+
+        self.sources = source_set
+        self.split_check.setEnabled(len(self.sources.providers) > 1)
+        if len(self.sources.providers) < 2:
+            self.split_check.setChecked(False)
+        elif split_was_enabled:
+            self.split_check.setChecked(True)
+        self._loadPanes(left_key, right_key)
+        self.left_pane.setViewState(left_state, emit_signal=False)
+        if self.split_check.isChecked():
+            self.right_pane.setViewState(right_state, emit_signal=False)
+        self.footer.setText(self._base_footer_text)
+        self._archive_worker = None
+
+    def _onArchiveSourcesFailed(self, message: str, generation: int):
+        if generation != self._source_generation:
+            return
+        self.footer.setText(self._base_footer_text + " " + self.tr(f"BSA source scan failed: {message}"))
+        self._archive_worker = None
+
+    def _findLiveUmpBridge(self):
+        app = QApplication.instance()
+        if app is None:
+            return None
+        seen = set()
+        for widget in QApplication.allWidgets():
+            objects = [widget]
+            try:
+                objects.extend(widget.findChildren(QWidget))
+            except Exception:
+                pass
+            for obj in objects:
+                marker = id(obj)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                bridge = getattr(obj, "find_nif_references", None)
+                if callable(bridge):
+                    return bridge
+        return None
+
+    def _driveUmpSearchUi(self, query: str) -> bool:
+        app = QApplication.instance()
+        if app is None:
+            return False
+        for tab_widget in QApplication.allWidgets():
+            if not isinstance(tab_widget, QTabWidget):
+                continue
+            for index in range(tab_widget.count()):
+                title = tab_widget.tabText(index).lower().replace("&", "")
+                if "nif" not in title or "dds" not in title:
+                    continue
+                tab_widget.setCurrentIndex(index)
+                page = tab_widget.widget(index)
+                target = page.widget() if isinstance(page, QScrollArea) and page.widget() else page
+                if self._populateUmpSearchPage(target, query):
+                    window = tab_widget.window()
+                    if window:
+                        window.show()
+                        window.raise_()
+                        window.activateWindow()
+                    return True
+        return False
+
+    def _populateUmpSearchPage(self, target, query: str) -> bool:
+        if target is None:
+            return False
+
+        for radio in target.findChildren(QRadioButton):
+            text = radio.text().lower().replace(" ", "")
+            if "dds" in text and "nif" in text and text.find("dds") < text.find("nif"):
+                radio.setChecked(True)
+                break
+
+        inputs = [line for line in target.findChildren(QLineEdit) if line.isEnabled()]
+        if not inputs:
+            return False
+        search_input = inputs[0]
+        search_input.setText(query)
+        search_input.setFocus()
+        search_input.selectAll()
+
+        for button in target.findChildren(QPushButton):
+            if "search" in button.text().lower() and button.isEnabled():
+                button.click()
+                return True
+        return True
+
     def _logGlErrors(self):
         try:
             return bool(self.plugin.pluginSetting("log gl errors"))
@@ -1269,6 +1469,13 @@ class DdsPreviewWidget(QWidget):
             self.right_pane.cleanup()
         except Exception:
             pass
+        if self._archive_worker is not None:
+            try:
+                self._archive_worker.resolved.disconnect(self._onArchiveSourcesResolved)
+                self._archive_worker.failed.disconnect(self._onArchiveSourcesFailed)
+            except Exception:
+                pass
+            self._archive_worker = None
         self._chrome_guard.restore()
 
     def tr(self, str_):
@@ -1314,6 +1521,11 @@ class DDSPreview(mobase.IPluginPreview):
         self.options = DDSOptions(savedColour)
         self.channelManager = DDSChannelManager(savedChannels)
         self.channelManager.setChannels(self.options, savedChannels)
+        app = QApplication.instance()
+        if app is not None:
+            handlers = getattr(app, "ump_preview_file_handlers", {})
+            handlers["dds"] = self
+            setattr(app, "ump_preview_file_handlers", handlers)
         return True
 
     def pluginSetting(self, name):
@@ -1394,13 +1606,13 @@ class DDSPreview(mobase.IPluginPreview):
             error_widget.setWordWrap(True)
             return error_widget
 
-        source_set = resolve_dds_sources(self.__organizer, fileName, b"")
+        source_set = resolve_dds_sources(self.__organizer, fileName, b"", include_archives=False)
         return self.__makePreviewWidget(source_set, fileName, b"")
 
     def genDataPreview(self, fileData: bytes, fileName: str, maxSize: QSize) -> QWidget:
         data = bytes(fileData or b"")
         print(f"DEBUG: genDataPreview called, fileName = {fileName}, data length = {len(data)}")
-        source_set = resolve_dds_sources(self.__organizer, fileName, data)
+        source_set = resolve_dds_sources(self.__organizer, fileName, data, include_archives=False)
         return self.__makePreviewWidget(source_set, fileName, data)
 
     def tr(self, str):

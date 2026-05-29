@@ -194,6 +194,24 @@ class DdsSourceResolutionTests(unittest.TestCase):
         self.assertEqual(result.providers[0].data, data)
         self.assertEqual(result.current_index, 0)
 
+    def test_archive_scan_can_be_deferred_for_fast_initial_preview(self) -> None:
+        virtual = "textures/demo/core.dds"
+        data = b"dds bytes from archive"
+        archive_mod = self._make_mod("ArchiveMod")
+        _write_bsa(Path(archive_mod.absolutePath()) / "ArchiveAssets.bsa", 105, {virtual: data})
+        organizer = FakeOrganizer(
+            self.root,
+            origins=[],
+            mods={"ArchiveMod": archive_mod},
+            order=["ArchiveMod"],
+        )
+
+        result = resolve_dds_sources(organizer, virtual, data, include_archives=False)
+
+        self.assertEqual(len(result.providers), 1)
+        self.assertEqual(result.providers[0].source_kind, "memory")
+        self.assertEqual(result.providers[0].display_name, "Current Archive Preview")
+
     def test_unmatched_archive_preview_falls_back_to_memory_provider(self) -> None:
         virtual = "textures/demo/missing.dds"
         data = b"opened from an archive MO2 did not expose"
